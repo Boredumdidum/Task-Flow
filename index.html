@@ -534,6 +534,10 @@
         <input type="checkbox" id="taskAllDay" onchange="toggleAllDay()" />
         All day
       </label>
+      <label class="task-allday-row">
+        <input type="checkbox" id="gcalPushAsTask" />
+        GCal task mode
+      </label>
     </div>
     <button class="add-btn" onclick="addTask()" style="display:flex;align-items:center;justify-content:center;"><i data-lucide="plus" style="width:18px;height:18px;"></i></button>
   </div>
@@ -766,7 +770,7 @@ function initGoogleAuth() {
 
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: config.clientId,
-    scope: 'https://www.googleapis.com/auth/calendar.events',
+    scope: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/tasks',
     callback: (resp) => {
       if (resp.error) { showToast('Auth failed: ' + resp.error, true); return; }
       accessToken = resp.access_token;
@@ -818,6 +822,7 @@ function addTask() {
     allDay: allDay,
     duration: 60,
     gcalEventId: null,
+    gcalTaskId: null,
   };
 
   tasks.unshift(task);
@@ -842,10 +847,15 @@ function deleteTask(id) {
   render();
 }
 
+function isInGCal(task) {
+  return !!(task?.gcalEventId || task?.gcalTaskId);
+}
+
 async function pushToGCal(id) {
   if (!accessToken) { authenticate(); return; }
   const t = tasks.find(t => t.id === id);
-  if (!t) return;
+  if (!t || isInGCal(t)) return;
+  const pushAsTask = document.getElementById('gcalPushAsTask')?.checked;
 
   const btn = document.querySelector(`[data-push="${id}"]`);
   if (btn) { btn.disabled = true; btn.textContent = '…'; }
@@ -877,6 +887,47 @@ async function pushToGCal(id) {
   }
 
   try {
+    if (pushAsTask) {
+      const taskPayload = {
+        title: t.text,
+        notes: 'Created in TaskFlow',
+      };
+      if (t.dueDate) {
+        taskPayload.due = new Date(t.allDay ? `${t.dueDate.slice(0, 10)}T00:00:00` : t.dueDate).toISOString();
+      }
+
+      const taskRes = await fetch(
+        'https://tasks.googleapis.com/tasks/v1/lists/@default/tasks',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer ' + accessToken,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(taskPayload),
+        }
+      );
+
+      if (!taskRes.ok) {
+        const err = await taskRes.json();
+        if (err.error?.status === 'UNAUTHENTICATED') {
+          accessToken = null; updateGCalButton(false);
+          showToast('Session expired — reconnect', true);
+        } else {
+          showToast('GCal task error: ' + (err.error?.message || 'unknown'), true);
+        }
+        if (btn) { btn.disabled = false; btn.textContent = '→ gcal'; }
+        return;
+      }
+
+      const taskData = await taskRes.json();
+      t.gcalTaskId = taskData.id;
+      save();
+      render();
+      showToast('Added as Google Task ✓');
+      return;
+    }
+
     const res = await fetch(
       `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events`,
       {
@@ -1332,13 +1383,13 @@ function render() {
 
   const total = tasks.length;
   const done = tasks.filter(t => t.done).length;
-  const gcal = tasks.filter(t => t.gcalEventId).length;
+  const gcal = tasks.filter(t => isInGCal(t)).length;
   stats.innerHTML = `<span>${total}</span> tasks · <span>${done}</span> done · <span>${gcal}</span> in gcal`;
 
   const filtered = tasks.filter(t => {
     if (currentFilter === 'active') return !t.done;
     if (currentFilter === 'done') return t.done;
-    if (currentFilter === 'gcal') return !!t.gcalEventId;
+    if (currentFilter === 'gcal') return isInGCal(t);
     return true;
   });
 
@@ -1359,8 +1410,8 @@ function render() {
       }
     }
 
-    const gcalSection = t.gcalEventId
-      ? `<span class="gcal-badge" style="display:inline-flex;align-items:center;gap:3px;"><i data-lucide="check" style="width:9px;height:9px;"></i> GCal</span>`
+    const gcalSection = isInGCal(t)
+      ? `<span class="gcal-badge" style="display:inline-flex;align-items:center;gap:3px;"><i data-lucide="check" style="width:9px;height:9px;"></i> ${t.gcalTaskId ? 'GCal Task' : 'GCal Event'}</span>`
       : accessToken
         ? `<button class="gcal-push-btn" data-push="${t.id}" onclick="pushToGCal('${t.id}')" style="display:inline-flex;align-items:center;gap:3px;"><i data-lucide="calendar-plus" style="width:10px;height:10px;"></i> gcal</button>`
         : `<button class="gcal-push-btn" onclick="authenticate()" title="Connect GCal first" style="display:inline-flex;align-items:center;gap:3px;"><i data-lucide="calendar-plus" style="width:10px;height:10px;"></i> gcal</button>`;
