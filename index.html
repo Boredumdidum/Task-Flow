@@ -502,7 +502,7 @@
 
   <!-- Config Panel -->
   <div class="config-panel" id="configPanel">
-    <h3>Google Calendar API Setup</h3>
+    <h3>Google Calendar &amp; Tasks API Setup</h3>
     <div class="config-row">
       <input class="config-input" id="clientIdInput" type="text" placeholder="OAuth 2.0 Client ID (ends in .apps.googleusercontent.com)" maxlength="120" spellcheck="false" autocomplete="off" />
     </div>
@@ -520,7 +520,7 @@
     <p class="config-note">
       1. Go to <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a> → APIs &amp; Services → Credentials<br>
       2. Create OAuth 2.0 Client ID (Web app) → add this page's URL to Authorized JavaScript Origins<br>
-      3. Enable the Google Calendar API<br>
+      3. Enable the Google Calendar API and Google Tasks API<br>
       4. Find extra calendar IDs: calendar.google.com → calendar Settings → Integrate calendar
     </p>
   </div>
@@ -564,7 +564,7 @@
     <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;">
       <h3 style="font-family:Fraunces, serif; font-weight:300; font-size:1.3rem; margin:0;">Google Calendar</h3>
       <div style="display:flex; gap:6px;">
-        <button class="gcal-btn" id="refreshGCalBtn" onclick="fetchCalendarEvents()" style="display:flex;align-items:center;gap:5px;"><i data-lucide="refresh-cw" style="width:12px;height:12px;"></i> Refresh</button>
+        <button class="gcal-btn" id="refreshGCalBtn" onclick="fetchCalendarEvents(); syncGoogleTasks()" style="display:flex;align-items:center;gap:5px;"><i data-lucide="refresh-cw" style="width:12px;height:12px;"></i> Refresh</button>
       </div>
     </div>
     <div id="calLegend" style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; font-size:0.62rem; font-family:'DM Mono',monospace; letter-spacing:0.04em;"></div>
@@ -649,7 +649,11 @@ let tasks = JSON.parse(localStorage.getItem('tf_tasks') || '[]');
 let config = JSON.parse(localStorage.getItem('tf_config') || '{}');
 let tokenClient = null;
 let accessToken = null;
+let accessTokenRefreshTimer = null;
+let silentAuthRequest = false;
 let currentFilter = 'all';
+let googleTaskSyncTimer = null;
+let syncingGoogleTasks = false;
 
 // ── All-day toggle ─────────────────────────────────────────────────────
 function toggleAllDay() {
@@ -726,7 +730,9 @@ function toggleAuth() {
   if (!accessToken) {
     authenticate();
   } else {
-    accessToken = null;
+    clearGoogleAuth();
+    clearInterval(googleTaskSyncTimer);
+    googleTaskSyncTimer = null;
     updateGCalButton(false);
     showToast('Disconnected from Google Calendar');
   }
@@ -772,20 +778,50 @@ function initGoogleAuth() {
     client_id: config.clientId,
     scope: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/tasks',
     callback: (resp) => {
-      if (resp.error) { showToast('Auth failed: ' + resp.error, true); return; }
+      const wasSilent = silentAuthRequest;
+      silentAuthRequest = false;
+      if (resp.error) {
+        if (!wasSilent || (resp.error !== 'interaction_required' && resp.error !== 'login_required')) {
+          showToast('Auth failed: ' + resp.error, true);
+        }
+        updateGCalButton(false);
+        return;
+      }
       accessToken = resp.access_token;
+      clearTimeout(accessTokenRefreshTimer);
+      const refreshIn = Math.max((resp.expires_in || 3600) - 300, 60) * 1000;
+      accessTokenRefreshTimer = setTimeout(() => {
+        accessToken = null;
+        authenticateSilently();
+      }, refreshIn);
       updateGCalButton(true);
-      showToast('Connected to Google Calendar ✓');
+      if (!wasSilent) showToast('Connected to Google Calendar ✓');
       fetchCalendarEvents();
+      syncGoogleTasks();
+      clearInterval(googleTaskSyncTimer);
+      googleTaskSyncTimer = setInterval(syncGoogleTasks, 30000);
     },
   });
 
   updateGCalButton(false);
+  authenticateSilently();
 }
 
 function authenticate() {
   if (!tokenClient) { showToast('Save your config first', true); return; }
-  tokenClient.requestAccessToken();
+  tokenClient.requestAccessToken({ prompt: 'consent' });
+}
+
+function authenticateSilently() {
+  if (!tokenClient || accessToken) return;
+  silentAuthRequest = true;
+  tokenClient.requestAccessToken({ prompt: 'none' });
+}
+
+function clearGoogleAuth() {
+  accessToken = null;
+  clearTimeout(accessTokenRefreshTimer);
+  accessTokenRefreshTimer = null;
 }
 
 function updateGCalButton(connected) {
@@ -836,9 +872,22 @@ function addTask() {
   input.focus();
 }
 
-function toggleDone(id) {
+async function toggleDone(id) {
   const t = tasks.find(t => t.id === id);
-  if (t) { t.done = !t.done; save(); render(); }
+  if (!t) return;
+  const previousDone = t.done;
+  t.done = !t.done;
+  save();
+  render();
+
+  if (t.gcalTaskId && accessToken) {
+    const synced = await updateGoogleTask(t);
+    if (!synced) {
+      t.done = previousDone;
+      save();
+      render();
+    }
+  }
 }
 
 function deleteTask(id) {
@@ -849,6 +898,127 @@ function deleteTask(id) {
 
 function isInGCal(task) {
   return !!(task?.gcalEventId || task?.gcalTaskId);
+}
+
+function googleTaskDueDate(rawDue) {
+  if (!rawDue) return null;
+  const due = new Date(rawDue);
+  if (Number.isNaN(due.getTime())) return null;
+  const pad = n => String(n).padStart(2, '0');
+  return `${due.getFullYear()}-${pad(due.getMonth() + 1)}-${pad(due.getDate())}T${pad(due.getHours())}:${pad(due.getMinutes())}`;
+}
+
+function googleTaskPayload(task) {
+  const payload = {
+    title: task.text,
+    status: task.done ? 'completed' : 'needsAction',
+  };
+  if (task.dueDate) {
+    payload.due = new Date(task.allDay ? `${task.dueDate.slice(0, 10)}T00:00:00` : task.dueDate).toISOString();
+  }
+  return payload;
+}
+
+async function updateGoogleTask(task, showErrors = true) {
+  try {
+    const res = await fetch(
+      `https://tasks.googleapis.com/tasks/v1/lists/@default/tasks/${encodeURIComponent(task.gcalTaskId)}`,
+      {
+        method: 'PATCH',
+        headers: {
+          Authorization: 'Bearer ' + accessToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(googleTaskPayload(task)),
+      }
+    );
+
+    if (res.ok) return true;
+    const err = await res.json().catch(() => ({}));
+    if (res.status === 401 || err.error?.status === 'UNAUTHENTICATED') {
+      clearGoogleAuth();
+      clearInterval(googleTaskSyncTimer);
+      googleTaskSyncTimer = null;
+      updateGCalButton(false);
+      if (showErrors) showToast('Session expired — reconnect', true);
+    } else if (showErrors) {
+      showToast('Google Task update error: ' + (err.error?.message || res.statusText), true);
+    }
+  } catch (e) {
+    if (showErrors) showToast('Network error updating Google Task', true);
+  }
+  return false;
+}
+
+async function syncGoogleTasks() {
+  if (!accessToken || syncingGoogleTasks) return;
+  syncingGoogleTasks = true;
+
+  try {
+    const res = await fetch(
+      'https://tasks.googleapis.com/tasks/v1/lists/@default/tasks?showCompleted=true&showHidden=true&maxResults=100',
+      { headers: { Authorization: 'Bearer ' + accessToken } }
+    );
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      if (res.status === 401 || err.error?.status === 'UNAUTHENTICATED') {
+        clearGoogleAuth();
+        clearInterval(googleTaskSyncTimer);
+        googleTaskSyncTimer = null;
+        updateGCalButton(false);
+        showToast('Session expired — reconnect', true);
+      } else {
+        showToast('Google Tasks sync error: ' + (err.error?.message || res.statusText), true);
+      }
+      return;
+    }
+
+    const data = await res.json();
+    let changed = false;
+    (data.items || []).forEach(remote => {
+      if (remote.deleted) return;
+      let local = tasks.find(task => task.gcalTaskId === remote.id);
+
+      if (!local) {
+        local = {
+          id: `gcal-task-${remote.id}`,
+          text: remote.title || 'Untitled Google Task',
+          done: remote.status === 'completed',
+          createdAt: remote.updated || new Date().toISOString(),
+          dueDate: googleTaskDueDate(remote.due),
+          allDay: false,
+          duration: 60,
+          gcalEventId: null,
+          gcalTaskId: remote.id,
+        };
+        tasks.unshift(local);
+        changed = true;
+        return;
+      }
+
+      const remoteDueDate = googleTaskDueDate(remote.due);
+      const remoteDone = remote.status === 'completed';
+      if (local.text !== (remote.title || 'Untitled Google Task')
+        || local.done !== remoteDone
+        || local.dueDate !== remoteDueDate) {
+        local.text = remote.title || 'Untitled Google Task';
+        local.done = remoteDone;
+        local.dueDate = remoteDueDate;
+        local.allDay = false;
+        changed = true;
+      }
+    });
+
+    if (changed) {
+      save();
+      render();
+    }
+  } catch (e) {
+    showToast('Network error syncing Google Tasks', true);
+  } finally {
+    syncingGoogleTasks = false;
+  }
 }
 
 async function pushToGCal(id) {
@@ -911,7 +1081,7 @@ async function pushToGCal(id) {
       if (!taskRes.ok) {
         const err = await taskRes.json();
         if (err.error?.status === 'UNAUTHENTICATED') {
-          accessToken = null; updateGCalButton(false);
+          clearGoogleAuth(); updateGCalButton(false);
           showToast('Session expired — reconnect', true);
         } else {
           showToast('GCal task error: ' + (err.error?.message || 'unknown'), true);
@@ -943,7 +1113,7 @@ async function pushToGCal(id) {
     if (!res.ok) {
       const err = await res.json();
       if (err.error?.status === 'UNAUTHENTICATED') {
-        accessToken = null; updateGCalButton(false);
+        clearGoogleAuth(); updateGCalButton(false);
         showToast('Session expired — reconnect', true);
       } else {
         showToast('GCal error: ' + (err.error?.message || 'unknown'), true);
@@ -1363,6 +1533,7 @@ async function createCalendarEvent() {
     ['evTitle','evStart','evEnd','evDesc'].forEach(id => document.getElementById(id).value = '');
     document.getElementById('createEventPanel').style.display = 'none';
     fetchCalendarEvents();
+    syncGoogleTasks();
   } catch (e) {
     showToast('Network error creating event', true);
   }
