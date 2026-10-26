@@ -519,7 +519,7 @@
     </div>
     <p class="config-note">
       1. Go to <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a> → APIs &amp; Services → Credentials<br>
-      2. Create OAuth 2.0 Client ID (Web app) → add this page's URL to Authorized JavaScript Origins<br>
+      2. Create OAuth 2.0 Client ID (Web app) → add this site's origin to Authorized JavaScript Origins (for example, <code id="oauthOrigin"></code>)<br>
       3. Enable the Google Calendar API and Google Tasks API<br>
       4. Find extra calendar IDs: calendar.google.com → calendar Settings → Integrate calendar
     </p>
@@ -651,6 +651,8 @@ let tokenClient = null;
 let accessToken = null;
 let accessTokenRefreshTimer = null;
 let silentAuthRequest = false;
+let authRequestInFlight = false;
+let authRequestTimeout = null;
 let currentFilter = 'all';
 let googleTaskSyncTimer = null;
 let syncingGoogleTasks = false;
@@ -777,9 +779,28 @@ function initGoogleAuth() {
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: config.clientId,
     scope: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/tasks',
+    error_callback: (error) => {
+      const wasSilent = silentAuthRequest;
+      silentAuthRequest = false;
+      authRequestInFlight = false;
+      clearTimeout(authRequestTimeout);
+      authRequestTimeout = null;
+
+      if (wasSilent) return;
+      const message = error?.type === 'popup_failed_to_open'
+        ? 'Google sign-in popup was blocked — allow popups for this site and try again'
+        : error?.type === 'popup_closed'
+          ? 'Google sign-in was cancelled'
+          : 'Google sign-in could not be completed';
+      showToast(message, true);
+      updateGCalButton(false);
+    },
     callback: (resp) => {
       const wasSilent = silentAuthRequest;
       silentAuthRequest = false;
+      authRequestInFlight = false;
+      clearTimeout(authRequestTimeout);
+      authRequestTimeout = null;
       if (resp.error) {
         if (!wasSilent || (resp.error !== 'interaction_required' && resp.error !== 'login_required')) {
           showToast('Auth failed: ' + resp.error, true);
@@ -809,13 +830,26 @@ function initGoogleAuth() {
 
 function authenticate() {
   if (!tokenClient) { showToast('Save your config first', true); return; }
-  tokenClient.requestAccessToken({ prompt: 'consent' });
+  requestGoogleToken('consent', false);
 }
 
 function authenticateSilently() {
   if (!tokenClient || accessToken) return;
-  silentAuthRequest = true;
-  tokenClient.requestAccessToken({ prompt: 'none' });
+  requestGoogleToken('none', true);
+}
+
+function requestGoogleToken(prompt, silent) {
+  if (!tokenClient || authRequestInFlight) return;
+  authRequestInFlight = true;
+  silentAuthRequest = silent;
+  clearTimeout(authRequestTimeout);
+  authRequestTimeout = setTimeout(() => {
+    authRequestInFlight = false;
+    silentAuthRequest = false;
+    authRequestTimeout = null;
+    if (!silent) showToast('Google sign-in timed out — check popups and try again', true);
+  }, 10000);
+  tokenClient.requestAccessToken({ prompt });
 }
 
 function clearGoogleAuth() {
@@ -1623,6 +1657,8 @@ function showToast(msg, isError = false) {
 
 // ── Init ───────────────────────────────────────────────────────────────
 window.addEventListener('load', () => {
+  const origin = document.getElementById('oauthOrigin');
+  if (origin) origin.textContent = window.location.origin;
   const tryInit = setInterval(() => {
     if (window.google?.accounts?.oauth2 && config.clientId) {
       clearInterval(tryInit);
